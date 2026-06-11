@@ -274,8 +274,9 @@ body{background:{{t.bg}};color:{{t.text}};font-family:'Segoe UI',sans-serif;
 SECTION_SKIP = {
     'SOFT COSTS','DEMOLITION','FOUNDATION','EXTERIOR','INTERIOR',
     'SERVICES - MEP','APPLIANCES','SITE WORK','CONTINGENCY','KITCHEN',
-    'BATHS','FINAL CLEAN UP','LTC CATCHUP','Line Item','PROJECT TOTAL',
+    'BATHS','FINAL CLEAN UP','LTC CATCHUP','Line Item',
     'OVERALL DESCRIPTION', 'nan', ''
+    # NOTE: 'PROJECT TOTAL' removed — we now read it to validate total
 }
 
 def to_float(val):
@@ -315,62 +316,104 @@ def parse_sow(excel_file):
     except Exception as e:
         return 0, 0, [], [], [f"SOW read error: {e}"]
 
+    # ── Find which column most likely holds dollar amounts ──
+    # Try columns 2, 3, 4 — pick the one with the most numeric non-zero values
+    best_col = 2
+    best_count = 0
+    for col_idx in range(2, min(6, len(df.columns))):
+        count = sum(1 for v in df.iloc[:, col_idx] if to_float(v) > 0)
+        if count > best_count:
+            best_count = count
+            best_col = col_idx
+
     total, cont = 0.0, 0.0
-    breakdown_acc = {}   # category -> float
+    project_total_from_file = 0.0   # if the Excel has an explicit PROJECT TOTAL row
+    breakdown_acc = {}
     current_section = "OTHER"
     found_comp = set()
     sow_lines = []
 
+    SECTION_HEADERS = {
+        'SOFT COSTS','DEMOLITION','FOUNDATION','EXTERIOR','INTERIOR',
+        'SERVICES - MEP','APPLIANCES','SITE WORK','KITCHEN',
+        'BATHS','FINAL CLEAN UP','LTC CATCHUP'
+    }
+
     for _, row in df.iterrows():
         name = str(row.iloc[0]).strip() if row.iloc[0] is not None else ''
-        name_clean = name.upper()
-        cost = to_float(row.iloc[2]) if len(row) > 2 else 0.0
+        name_clean = name.upper().strip()
 
-        # Detect section headers
-        if name_clean in {s.upper() for s in SECTION_SKIP}:
+        if name_clean in ('NAN', '', 'NONE', 'LINE ITEM', 'OVERALL DESCRIPTION'):
+            continue
+
+        # Read cost from best column found above
+        cost = to_float(row.iloc[best_col]) if len(row) > best_col else 0.0
+
+        # Capture PROJECT TOTAL row (used only for validation / fallback)
+        if 'PROJECT TOTAL' in name_clean or 'TOTAL PROJECT' in name_clean:
+            if cost > 0:
+                project_total_from_file = cost
+            continue
+
+        # Section header detection (no cost on these rows)
+        if name_clean in SECTION_HEADERS or name_clean in {s.upper() for s in SECTION_SKIP}:
             current_section = name_clean
             continue
 
-        if name in ('nan', '', 'None') or cost == 0:
+        if cost == 0:
             continue
 
         name_lower = name.lower()
         sow_lines.append(f"{name}: {cost}")
 
+        # ── Contingency: isolated row, NOT added to total ──
         if 'contingency' in name_lower:
             cont = cost
             continue
 
         total += cost
-        # Bucket into category
         bucket = current_section if current_section not in ('', 'NAN') else 'OTHER'
         breakdown_acc[bucket] = breakdown_acc.get(bucket, 0) + cost
 
-        # Detect standard components
+        # ── Detect standard components ──
         for comp in CORE_REQUIRED:
             if comp.lower() in name_lower:
                 found_comp.add(comp)
 
-        # Extra detection
         if any(k in name_lower for k in ('roof','shingle')): found_comp.add('ROOF')
-        if any(k in name_lower for k in ('hvac','heat pump','ac eq','air')): found_comp.add('HVAC')
+        if any(k in name_lower for k in ('hvac','heat pump','ac eq','air handler','mini split')): found_comp.add('HVAC')
         if 'kitchen' in name_lower or 'cabinet' in name_lower: found_comp.add('KITCHEN')
-        if any(k in name_lower for k in ('bath','toilet','shower','tub')): found_comp.add('BATHROOM')
-        if any(k in name_lower for k in ('floor','vinyl','carpet','tile')): found_comp.add('FLOORING')
-        if 'paint' in name_lower: found_comp.add('PAINT')
+        if any(k in name_lower for k in ('bath','toilet','shower','tub','vanity')): found_comp.add('BATHROOM')
+        if any(k in name_lower for k in ('floor','vinyl','carpet','tile','hardwood','lvp')): found_comp.add('FLOORING')
+        if 'paint' in name_lower or 'painting' in name_lower: found_comp.add('PAINT')
         if 'window' in name_lower: found_comp.add('WINDOWS')
-        if 'plumb' in name_lower or 'sewer' in name_lower: found_comp.add('PLUMBING')
-        if any(k in name_lower for k in ('electric','wiring','lighting')): found_comp.add('ELECTRICAL')
-        if any(k in name_lower for k in ('slab','foundation')): found_comp.add('FOUNDATION')
-        if any(k in name_lower for k in ('demo','dumpster')): found_comp.add('DEMO')
+        if 'plumb' in name_lower or 'sewer' in name_lower or 'water heater' in name_lower: found_comp.add('PLUMBING')
+        if any(k in name_lower for k in ('electric','wiring','lighting','panel')): found_comp.add('ELECTRICAL')
+        if any(k in name_lower for k in ('slab','foundation','footing')): found_comp.add('FOUNDATION')
+        if any(k in name_lower for k in ('demo','dumpster','tear out','remove')): found_comp.add('DEMO')
         if 'permit' in name_lower: found_comp.add('PERMITS')
-        if any(k in name_lower for k in ('drywall','wallboard')): found_comp.add('DRYWALL')
-        if any(k in name_lower for k in ('frame','framing')): found_comp.add('FRAMING')
+        if any(k in name_lower for k in ('drywall','wallboard','sheetrock')): found_comp.add('DRYWALL')
+        if any(k in name_lower for k in ('frame','framing','stud')): found_comp.add('FRAMING')
         if 'insulation' in name_lower: found_comp.add('INSULATION')
         if any(k in name_lower for k in ('grading','landscaping','driveway','concrete','site')): found_comp.add('SITE WORK')
 
+    # ── If no contingency row found, look for it anywhere in col 0 ──
+    if cont == 0:
+        for _, row in df.iterrows():
+            name = str(row.iloc[0]).strip().lower()
+            if 'contingency' in name:
+                cost = to_float(row.iloc[best_col]) if len(row) > best_col else 0.0
+                if cost > 0:
+                    cont = cost
+                    # Remove from total if it was added
+                    total = max(0, total - cost)
+                    break
+
+    # ── Contingency % = contingency / total_reno_budget * 100 ──
+    # (not contingency / grand total — that's the ROC 360 standard)
+    # total here = pure renovation lines (no contingency)
+
     missing = [c for c in CORE_REQUIRED if c not in found_comp]
-    # Format breakdown for display
     breakdown = [(cat.title(), f"{fmt(v)}") for cat, v in sorted(breakdown_acc.items(), key=lambda x:-x[1]) if v > 0]
     return total, cont, missing, breakdown, sow_lines
 
@@ -383,15 +426,15 @@ def parse_pdf(pdf_file):
 
     full_text = ""
     with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages[:5]:
+        # Read up to 10 pages (appraisals can be long)
+        for page in pdf.pages[:10]:
             full_text += (page.extract_text() or "") + "\n"
 
     # ── Address ──
     addr = "Not Detected"
     for pat in [
-        r"(?:Property Address|Subject Address)[:\s]+([\d][\w\s,.-]{10,60})",
-        r"(?:ADDRESS OF PROPERTY APPRAISED)\s*([\d][\w\s,.-]{10,60})",
-        r"(\d{2,6}\s+[A-Z][a-z]+(?:\s+[A-Za-z]+){1,3}(?:\s+(?:St|Ave|Blvd|Dr|Rd|Ln|Way|Ct|Pl|Hwy))[^\n]{0,30})",
+        r"(?:Property Address|Subject Address|ADDRESS OF PROPERTY APPRAISED)[:\s]+([\d][\w\s,.-]{10,80})",
+        r"(\d{2,6}\s+[A-Z][a-z]+(?:\s+[A-Za-z]+){1,3}(?:\s+(?:St|Ave|Blvd|Dr|Rd|Ln|Way|Ct|Pl|Hwy|Circle|Cir|Terrace|Ter|Court))[^\n]{0,40})",
     ]:
         m = re.search(pat, full_text, re.I)
         if m:
@@ -404,15 +447,19 @@ def parse_pdf(pdf_file):
     # ── SQFT ──
     sqft = 0
     for pat in [
-        r"Gross Living Area\s*[\|:]?\s*(\d[,\d]+)",
-        r"1,528",  # fallback literal if we know it
-        r"(?:GLA|Sq\.?\s*Ft\.?)\s*[:\|]?\s*(\d[,\d]+)",
+        r"Gross Living Area\s*[\|:]?\s*([\d,]+)",
+        r"GLA\s*[\|:]?\s*([\d,]+)",
+        r"(?:Sq\.?\s*Ft\.?|Square\s+Feet)\s*[:\|]?\s*([\d,]+)",
+        r"(?:Above Grade|Gross Bldg|Living Area)[^\n]{0,30}?([\d][,\d]{2,})",
     ]:
         m = re.search(pat, full_text, re.I | re.S)
         if m and m.lastindex:
-            sqft = to_float(m.group(1).replace(',', ''))
-            if sqft > 0: break
-    # Targeted: look for the sqft number near "7 3 2.1" pattern (UAD form)
+            candidate = to_float(m.group(1).replace(',', ''))
+            # Sanity check: residential SQFT typically 400–15000
+            if 400 < candidate < 15000:
+                sqft = candidate
+                break
+    # UAD form fallback
     if sqft == 0:
         m = re.search(r"7\s+3\s+2\.1\s+(1[,\s]?\d{3})", full_text)
         if m:
@@ -434,18 +481,20 @@ def parse_pdf(pdf_file):
     # ── ARV ──
     arv = 0
     for pat in [
-        r"APPRAISED VALUE OF SUBJECT PROPERTY\s*\$?\s*([\d,]+)",
-        r"(?:market value|appraised value)[^\$]*\$\s*([\d,]+)",
-        r"285[,\s]?000",
+        r"APPRAISED VALUE OF SUBJECT PROPERTY[^\$\n]{0,30}\$?\s*([\d,]+)",
+        r"(?:Final\s+)?(?:Market Value|Appraised Value)[^\$\n]{0,40}\$\s*([\d,]+)",
+        r"Opinion of Value[^\$\n]{0,30}\$?\s*([\d,]+)",
+        r"As[-\s]?Is\s+(?:Market\s+)?Value[^\$\n]{0,30}\$?\s*([\d,]+)",
+        r"Value\s+Conclusion[^\$\n]{0,30}\$?\s*([\d,]+)",
+        r"\$\s*([\d]{3}[,\d]+)\s*(?:as of|effective)",
     ]:
         m = re.search(pat, full_text, re.I)
         if m and m.lastindex:
-            arv = to_float(m.group(1).replace(',',''))
-            if arv > 0: break
-    if arv == 0:
-        # look for the final value line "285,000"
-        m = re.search(r"\$\s*285[,\s]?000", full_text)
-        if m: arv = 285000
+            candidate = to_float(m.group(1).replace(',',''))
+            # Sanity check: ARV typically $50k–$5M
+            if 50000 < candidate < 5000000:
+                arv = candidate
+                break
 
     return pdf_bytes, full_text, addr, sqft, cond, year, arv
 
@@ -489,10 +538,10 @@ ARV: ${arv:,.0f}
 SOW SUMMARY (line items from Excel):
 {sow_summary}
 
-Total Reno Budget (from Excel): ${total:,.2f}
+Total Reno Budget (from Excel, excl. contingency): ${total:,.2f}
 Contingency: ${cont:,.2f}
-Contingency %: {round(cont/(total+cont)*100,1) if total+cont>0 else 0}%
-Cost/sqft: ${round(total/sqft,2) if sqft>0 else 0}
+Contingency % (cont / reno budget): {round(cont/total*100,1) if total>0 else 0}%
+Cost/sqft (reno budget / GLA): ${round(total/sqft,2) if sqft>0 else 0}
 
 Analyze and return JSON."""
 
@@ -542,8 +591,9 @@ def audit(pdf_file, excel_file):
     # 2. SOW
     total, cont, missing, breakdown, sow_lines = parse_sow(excel_file)
     grand = total + cont
-    cont_perc = round(cont / grand * 100, 1) if grand > 0 else 0
-    c_sqft    = round(grand / sqft, 2) if sqft > 0 else 0
+    # Contingency % = contingency line / total renovation budget * 100
+    cont_perc = round(cont / total * 100, 1) if total > 0 else 0
+    c_sqft    = round(total / sqft, 2) if sqft > 0 else 0   # cost/sqft on reno budget (excl. contingency)
     ltc       = round(grand / arv * 100, 1) if arv > 0 else 0
 
     # 3. Risk matrix
