@@ -1,0 +1,6 @@
+flask
+pdfplumber
+pandas
+openpyxl
+python-dotenv
+gunicorn
